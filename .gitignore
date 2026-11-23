@@ -1,0 +1,26 @@
+# Runtime records and personal backups
+logs/
+log/
+*.log
+*.zip
+*.bundle
+*.update_tmp
+
+# Python / ROS build output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+install/
+.venv/
+venv/
+
+# Rebuilt locally by setup.sh from the installed TurtleBot3 package
+models/camera_burger/
+MANIFEST.sha256
+
+# Local editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

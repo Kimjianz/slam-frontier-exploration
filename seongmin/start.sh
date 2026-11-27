@@ -2,6 +2,8 @@
 # 방탈출 전체 실행 스크립트
 #   ./start.sh          : 환경(Gazebo, SLAM, RViz, Nav2) + 방탈출 노드까지 실행
 #   ./start.sh env      : 환경만 실행 (방탈출 노드는 직접 실행)
+#   ./start.sh norviz   : RViz 없이 실행 (VM에서 시뮬레이션이 더 빨라짐)
+#   ./start.sh env norviz
 #
 # 각 프로그램의 로그는 /tmp/escape_logs/ 에 저장됨
 
@@ -45,13 +47,26 @@ echo "[2/5] SLAM Toolbox"
 ros2 launch slam_toolbox online_async_launch.py use_sim_time:=true > "$LOG_DIR/slam.log" 2>&1 &
 sleep 5
 
-echo "[3/5] RViz"
-ros2 run rviz2 rviz2 -d /opt/ros/jazzy/share/nav2_bringup/rviz/nav2_default_view.rviz \
-    > "$LOG_DIR/rviz.log" 2>&1 &
+if [ "$1" == "norviz" ] || [ "$2" == "norviz" ]; then
+    echo "[3/5] RViz 생략 (norviz)"
+else
+    echo "[3/5] RViz"
+    ros2 run rviz2 rviz2 -d /opt/ros/jazzy/share/nav2_bringup/rviz/nav2_default_view.rviz \
+        > "$LOG_DIR/rviz.log" 2>&1 &
+fi
 
 echo "[4/5] Nav2 (활성화될 때까지 대기)"
+# TurtleBot3 공식 Nav2 설정을 복사해서 세 가지만 바꿔서 사용
+#  1) yaw_goal_tolerance 3.14 : explore_lite가 목표 방향을 항상 동쪽으로 보내서 매번 멈춰서 도는 문제 방지
+#  2) collision_monitor 규칙은 'PolygonStop'(0.1m 안 정지)만 사용 : 벽 근처에서 속도를 0까지 줄여 멈추는 문제 방지
+#  3) robot_radius 0.2 : waffle 실제 크기(폭 약 0.3m)에 맞춰 벽에서 조금 떨어진 경로를 계획
+NAV2_PARAMS="$LOG_DIR/nav2_params.yaml"
+sed -e 's/^\([[:space:]]*yaw_goal_tolerance:\).*/\1 3.14/' \
+    -e 's/^\([[:space:]]*polygons:\).*/\1 ["PolygonStop"]/' \
+    -e 's/^\([[:space:]]*robot_radius:\).*/\1 0.2/' \
+    /opt/ros/jazzy/share/turtlebot3_navigation2/param/waffle.yaml > "$NAV2_PARAMS"
 ros2 launch nav2_bringup navigation_launch.py use_sim_time:=true \
-    params_file:=/opt/ros/jazzy/share/turtlebot3_navigation2/param/waffle.yaml \
+    params_file:="$NAV2_PARAMS" \
     > "$LOG_DIR/nav2.log" 2>&1 &
 # Nav2 로그에 'Managed nodes are active'가 찍힐 때까지 기다림 (최대 5분)
 NAV2_OK=0
@@ -73,18 +88,11 @@ if [ $NAV2_OK -eq 0 ]; then
 fi
 echo "      Nav2 준비 완료"
 
-# 출발 직후 로봇 발밑이 지도에서 '모르는 곳'으로 남아서 explore_lite가 제자리만 맴도는 문제 방지
-echo "      로봇을 앞으로 약 0.4m 이동"
-ros2 topic pub --times 15 -r 5 /cmd_vel geometry_msgs/msg/TwistStamped \
-    "{header: {frame_id: base_link}, twist: {linear: {x: 0.15}}}" > /dev/null
-ros2 topic pub --once /cmd_vel geometry_msgs/msg/TwistStamped "{header: {frame_id: base_link}}" > /dev/null
-sleep 3
-
 if [ "$1" == "env" ]; then
     echo "환경 실행 완료. 방탈출 노드는 다른 터미널에서: ros2 run escape_robot escape_fsm"
     echo "끝내려면 Ctrl + C"
     wait
 else
     echo "[5/5] 방탈출 노드 실행 (Ctrl + C 로 전체 종료)"
-    ros2 run escape_robot escape_fsm
+    ros2 run escape_robot escape_fsm 2>&1 | tee "$LOG_DIR/fsm.log"
 fi

@@ -240,6 +240,8 @@ class Mission(Node):
                 target = self.probes[self.reached]
             else:
                 if self.reached >= self.maximum:
+                    if self.handle_search_limit(robot,sim):
+                        return
                     self.stop('지정한 목표 수의 탐색 시험이 끝났어. 전체 탐색 완료를 뜻하지는 않아.',0)
                     return
                 if wall < self.next_frontiers:
@@ -247,6 +249,8 @@ class Mission(Node):
                 self.next_frontiers = wall+1
                 choices = self.select_candidates(robot,sim)
                 if not choices:
+                    if self.handle_no_frontier(robot,sim):
+                        return
                     if self.no_goal_since is None:
                         self.no_goal_since = wall,sim
                     if wall-self.no_goal_since[0] > 120 or sim-self.no_goal_since[1] > 30:
@@ -303,6 +307,12 @@ class Mission(Node):
                     commands=self.commands)
         elif self.state.phase == 'CANCELLING' and self.state.expired(wall):
             self.stop('취소 완료를 확인하지 못했어. 자율 이동 터미널도 종료해야 해.',3)
+
+    def handle_no_frontier(self, robot, sim):
+        return False
+
+    def handle_search_limit(self, robot, sim):
+        return False
 
     def plan_accepted(self, future, generation):
         try:

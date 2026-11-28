@@ -1,4 +1,4 @@
-"""Camera key acquisition and door opening on the tested frontier controller."""
+"""RGB-D key acquisition, recoverable approaches, door passage and exit arrival."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -8,7 +8,9 @@ import time
 import cv2
 import rclpy
 from action_msgs.msg import GoalStatus
-from nav2_msgs.action import Spin
+from nav2_msgs.action import DriveOnHeading, Spin
+from nav2_msgs.srv import ClearEntireCostmap
+from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
 from rclpy.signals import SignalHandlerOptions
 from rclpy.time import Time
@@ -17,7 +19,12 @@ from tf2_ros import TransformException
 
 from .mission import Mission, ROOT, fingerprint
 from .actuator import SceneActuator
-from .vision import (ObservationGate, approach, depth_array, detect, forward_clear,
+from .approach_control import ApproachRecovery
+from .passage_control import PassageControl
+from .visual_search_control import VisualSearchControl
+from .console_logging import ConsoleLogging
+from .approach_planner import LIMITS, VerificationWindow
+from .vision import (ObservationGate, depth_array, detect,
                      optical_point, rgb_array, transform_point)
 
 
@@ -25,11 +32,25 @@ def stamp(message):
     return message.header.stamp.sec+message.header.stamp.nanosec/1e9
 
 
-class CameraEscape(Mission):
-    def __init__(self, maximum):
+class CameraEscape(ConsoleLogging,VisualSearchControl,ApproachRecovery,PassageControl,Mission):
+    def __init__(self, maximum, inspection_limit=16):
         super().__init__('explore',maximum)
         self.stage = 'SEARCH_KEY'
         self.key_collected = False
+        self.door_open = self.crossed_door = False
+        self.frame_counter = 0
+        self.target_label = None
+        self.object_point = None
+        self.target_goal_kind = 'approach'
+        self.rejected = {label:[] for label in LIMITS}
+        self.replan_counts = {label:0 for label in LIMITS}
+        self.reacquire_counts = {label:0 for label in LIMITS}
+        self.resume_counts = {label:0 for label in LIMITS}
+        self.object_cooldown = {label:0.0 for label in LIMITS}
+        self.next_approach_plan = 0.0
+        self.verification = None
+        self.sweep_purpose = 'search'
+        self.last_local_costmap = None
         self.rgb = self.depth = self.info = self.scan_message = None
         self.last_pair = -1.0
         self.camera_problem = ''
@@ -44,6 +65,9 @@ class CameraEscape(Mission):
         self.visible_labels = set()
         self.sweep_pending = True
         self.spin_client = ActionClient(self,Spin,'/spin')
+        self.drive_client = ActionClient(self,DriveOnHeading,'/drive_on_heading')
+        self.clear_local = self.create_client(ClearEntireCostmap,
+                              '/local_costmap/clear_entirely_local_costmap')
         self.worker = ThreadPoolExecutor(max_workers=1)
         self.operation = None
         self.actuator = SceneActuator(ROOT/'worlds/escape_room.world')
@@ -54,7 +78,10 @@ class CameraEscape(Mission):
                                                lambda m:setattr(self,'info',m),self.qos)
         self.door_scan_sub = self.create_subscription(LaserScan,'/scan',
                                     lambda m:setattr(self,'scan_message',m),self.qos)
-        self.emit('카메라 임무 시작: 노란 열쇠 블록 획득 후 빨간 문을 열게.')
+        self.local_sub = self.create_subscription(OccupancyGrid,'/local_costmap/costmap',
+                            lambda m:setattr(self,'last_local_costmap',(stamp(m),time.monotonic())),self.qos)
+        self.init_visual_search(inspection_limit)
+        self.emit('카메라 임무 시작: 열쇠 획득·문 통과 후 초록색 exit_marker까지 이동할게.')
 
     def receive_rgb(self, message):
         self.rgb = message
@@ -85,11 +112,14 @@ class CameraEscape(Mission):
                                          Time.from_msg(self.rgb.header.stamp)).transform
             translation = (tr.translation.x,tr.translation.y,tr.translation.z)
             rotation = (tr.rotation.x,tr.rotation.y,tr.rotation.z,tr.rotation.w)
+            observer = self.robot() if getattr(self,'_visual_search_ready',False) else None
             for detection in detections:
                 point = transform_point(optical_point(detection,self.info.k),translation,rotation)
                 stable = self.gate.update(detection.label,t,point)
                 if stable is not None:
                     self.observations[detection.label] = (stable,t,detection.depth)
+                    if observer is not None:
+                        self.object_memory.remember(detection.label,stable,observer,self.grid.frame,t)
                 x,y,w,h = detection.box
                 cv2.rectangle(rgb,(x,y),(x+w,y+h),(0,255,0),2)
                 cv2.putText(rgb,detection.label+' '+format(detection.depth,'.2f')+'m',
@@ -99,8 +129,11 @@ class CameraEscape(Mission):
             message.height,message.width = rgb.shape[:2]
             message.encoding,message.step,message.data = 'rgb8',rgb.shape[1]*3,rgb.tobytes()
             self.image_pub.publish(message)
+            if getattr(self,'_visual_search_ready',False):
+                self.record_camera_view(observer,t)
             self.visible_labels = {d.label for d in detections}
             self.last_pair,self.camera_sim,self.camera_wall = t,t,time.monotonic()
+            self.frame_counter = getattr(self,'frame_counter',0)+1
             self.camera_problem = ''
         except TransformException as error:
             self.camera_problem = str(error)
@@ -141,6 +174,9 @@ class CameraEscape(Mission):
         if self.stage == 'VERIFY_OPEN':
             self.verify_open(wall,sim)
             return
+        if self.stage in ('CLEAR_PASSAGE','WAIT_PASSAGE','CROSSING','VERIFY_CROSS'):
+            self.passage_tick(wall,sim,robot)
+            return
         if self.stage == 'VERIFY_PICKUP':
             if self.last_pair > self.pickup_stamp and 'key' not in self.visible_labels:
                 if not self.clear_stamps or self.last_pair > self.clear_stamps[-1]:
@@ -151,28 +187,45 @@ class CameraEscape(Mission):
                     self.sweep_pending = True
                     self.state.finish('SELECT')
                     self.emit('열쇠 획득 완료. 카메라로 빨간 문을 찾을게.')
+                    return
             else:
                 self.clear_stamps.clear()
-            if wall-self.wait_started > 25:
+            if self.pickup_window.expired(wall,sim):
                 self.stop('획득 요청 후 열쇠가 사라졌는지 카메라로 확인하지 못했어.',2)
             return
-        if self.stage in ('VERIFY_KEY','VERIFY_DOOR'):
+        if self.stage in ('VERIFY_KEY','VERIFY_DOOR','VERIFY_EXIT'):
             self.verify_arrival(wall,robot)
+            return
+        if self.stage.startswith('REPLAN_'):
+            self.replan_target(self.stage.split('_',1)[1].lower(),robot,wall)
+            return
+        if self.stage == 'REACQUIRE':
+            if self.state.expired(wall):
+                self.stop('물체 재탐색 회전의 제한 시간이 지났어.',2)
             return
         if self.stage == 'SWITCHING':
             if wall > self.switch_deadline:
                 self.stop('기존 목표 종료를 확인하지 못했어. 추가 이동을 보내지 않을게.',3)
             return
-        label = 'key' if self.stage == 'SEARCH_KEY' else 'door' if self.stage == 'SEARCH_DOOR' else None
+        label = {'SEARCH_KEY':'key','SEARCH_DOOR':'door','SEARCH_EXIT':'exit'}.get(self.stage)
         observed = self.recent(label) if label else None
         if (self.state.phase == 'WAIT' and robot is not None and self.sim()>0
                 and self.scan_stamp is not None and self.sim()-self.scan_stamp <= 1
                 and self.navigation_ready(wall)):
             self.state.finish('SELECT')
-        if label and observed is not None and robot is not None and self.state.phase != 'WAIT':
-            self.emit('카메라에서 목표를 확인했어.',label=label,depth=observed[2],position=observed[0])
-            self.request_switch(label,approach(robot,observed[0],.45 if label=='key' else .65))
+        if self.visual_search_tick(wall,sim,robot):
+            return
+        if (label and observed is not None and robot is not None and self.state.phase != 'WAIT'
+                and sim >= self.object_cooldown[label] and wall >= self.next_approach_plan):
+            self.next_approach_plan = wall+1
+            goal = self.choose_approach(label,robot,observed[0])
+            if goal is not None:
+                self.emit('카메라에서 목표를 확인했어.',label=label,depth=observed[2],position=observed[0])
+                self.request_switch(label,goal)
             if self.stage == 'SWITCHING':
+                return
+            if goal is not None:
+                super().tick()
                 return
         if label and self.state.phase == 'SELECT' and self.sweep_pending:
             self.start_sweep(wall)
@@ -183,17 +236,19 @@ class CameraEscape(Mission):
             return
         super().tick()
 
-    def start_sweep(self, wall):
+    def start_sweep(self, wall, angle=2*math.pi, purpose='search'):
         if not self.spin_client.server_is_ready():
             self.stop('카메라 둘러보기에 필요한 Nav2 회전 서버가 준비되지 않았어.',2)
             return
         goal = Spin.Goal()
-        goal.target_yaw = 2*math.pi
+        goal.target_yaw = float(angle)
         goal.time_allowance.sec = 120
+        self.sweep_purpose = purpose
+        self.sweep_view_bins,self.sweep_frames = set(),0
         generation = self.state.begin('SWEEP_REQUEST',wall,15)
         self.pending = self.spin_client.send_goal_async(goal)
         self.pending.add_done_callback(lambda f,g=generation:self.sweep_accepted(f,g))
-        self.emit('카메라로 주변을 한 바퀴 둘러볼게.')
+        self.emit('카메라로 주변을 둘러볼게.',purpose=purpose,angle=round(angle,3))
 
     def sweep_accepted(self, future, generation):
         if self.switch_acceptance(future,generation):
@@ -229,11 +284,22 @@ class CameraEscape(Mission):
                 return
             self.goal_handle = None
             self.sweep_pending = False
-            self.state.finish('SELECT')
+            if self.sweep_purpose == 'reacquire':
+                self.begin_verification(self.target_label)
+            elif self.sweep_purpose == 'passage':
+                self.begin_passage_clear()
+            elif self.sweep_purpose == 'inspection':
+                self.inspection_rotation_finished()
+            else:
+                self.note_search_sweep()
+                self.state.finish('SELECT')
         except Exception as error:
             self.stop('둘러보기 결과 오류: '+str(error),2)
 
     def request_switch(self, label, target):
+        if getattr(self,'_visual_search_ready',False):
+            self.inspection_current = None
+        self.target_label = label
         self.switch_target = label,target
         if self.state.phase == 'SELECT':
             self.activate_target()
@@ -250,7 +316,7 @@ class CameraEscape(Mission):
 
     def activate_target(self):
         label,target = self.switch_target
-        self.stage = 'APPROACH_KEY' if label=='key' else 'APPROACH_DOOR'
+        self.stage = 'APPROACH_'+label.upper()
         self.mode,self.reached,self.probes = 'probe',0,[target]
         self.goal_handle = None
         self.state.finish('SELECT')
@@ -303,7 +369,9 @@ class CameraEscape(Mission):
         if self.stage == 'SWITCHING':
             self.switched_result(future,generation)
             return
-        if self.stage not in ('APPROACH_KEY','APPROACH_DOOR'):
+        if self.handle_revisit_result(future,generation):
+            return
+        if self.stage not in ('APPROACH_KEY','APPROACH_DOOR','APPROACH_EXIT'):
             super().nav_result(future,generation)
             if not self.done and self.state.phase=='SELECT' and self.reached % 2 == 0:
                 self.sweep_pending = True
@@ -312,39 +380,14 @@ class CameraEscape(Mission):
             return
         try:
             if future.result().status != GoalStatus.STATUS_SUCCEEDED:
-                self.stop('물체로 접근하는 이동이 성공하지 못했어.',2)
+                self.failed('물체로 접근하는 이동이 성공하지 못했어.')
                 return
             self.goal_handle = None
-            self.state.finish('VERIFY')
-            self.stage = 'VERIFY_KEY' if self.stage=='APPROACH_KEY' else 'VERIFY_DOOR'
-            self.wait_started = time.monotonic()
-            self.emit('도착 후 카메라와 거리를 다시 확인할게.',stage=self.stage)
+            if self.target_goal_kind == 'observe':
+                self.rejected[self.target_label].append((self.target[:2],self.sim()+45))
+            self.begin_verification(self.target_label)
         except Exception as error:
             self.stop('도착 확인 오류: '+str(error),2)
-
-    def verify_arrival(self, wall, robot):
-        label = 'key' if self.stage=='VERIFY_KEY' else 'door'
-        observed = self.recent(label)
-        if observed is not None and robot is not None:
-            distance = math.dist(robot[:2],observed[0][:2])
-            if distance <= (.70 if label=='key' else .95):
-                if label=='door' and not self.key_collected:
-                    self.stop('열쇠 획득 기록이 없어 문을 열지 않을게.',2)
-                    return
-                if label=='door':
-                    scan = self.scan_message
-                    if scan is None or self.sim()-stamp(scan)>1 or forward_clear(scan):
-                        if wall-self.wait_started > 20:
-                            self.stop('문이 앞을 막고 있는지 라이다로 확인하지 못했어.',2)
-                        return
-                self.stage = 'PICKING' if label=='key' else 'OPENING'
-                self.operation = self.worker.submit(self.actuator.lift,
-                    'red_key' if label=='key' else 'red_door',self.key_collected)
-                self.switch_deadline = wall+10
-                self.emit('열쇠 획득을 요청했어.' if label=='key' else '열쇠를 사용해 문 열기를 요청했어.')
-                return
-        if wall-self.wait_started > 20:
-            self.stop('도착 후 물체와 가까운 거리를 카메라로 재확인하지 못했어.',2)
 
     def poll_operation(self, wall):
         if not self.operation.done():
@@ -356,40 +399,23 @@ class CameraEscape(Mission):
             if self.stage == 'PICKING':
                 self.stage = 'VERIFY_PICKUP'
                 self.pickup_stamp = self.sim()
+                self.pickup_window = VerificationWindow(wall,self.sim(),self.frame_counter)
                 self.wait_started = wall
                 self.clear_stamps = []
-                self.emit('열쇠 이동 요청이 승인됐어. 카메라로 획득 결과를 확인할게.')
+                self.emit('열쇠 삭제 요청이 승인됐어. 카메라로 사라졌는지 확인할게.')
             else:
                 self.stage = 'VERIFY_OPEN'
                 self.wait_started = wall
                 self.open_stamp = self.sim()
+                self.open_window = VerificationWindow(wall,self.sim(),self.frame_counter)
                 self.clear_stamps = []
                 self.emit('문 이동 요청이 승인됐어. 실제로 앞이 비었는지 라이다로 확인할게.')
         except Exception as error:
             self.stop('물체 조작 실패: '+str(error),2)
 
-    def verify_open(self, wall, sim):
-        if not self.key_collected:
-            self.stop('열쇠 획득 기록이 없어 문 열림 완료로 처리하지 않을게.',2)
-            return
-        scan = self.scan_message
-        if scan is not None and self.open_stamp < stamp(scan) <= sim+.2 and sim-stamp(scan) <= 1:
-            t = stamp(scan)
-            if not forward_clear(scan):
-                self.clear_stamps.clear()
-            elif not self.clear_stamps or t > self.clear_stamps[-1]:
-                self.clear_stamps.append(t)
-            if len(self.clear_stamps) >= 3:
-                self.stage = 'COMPLETE'
-                self.emit('카메라 열쇠 인식·획득·문 열림 확인 완료!',key_collected=True,door_open=True)
-                self.stop('임무 완료.',0)
-                return
-        if wall-self.wait_started > 30:
-            self.stop('문 열림을 라이다로 확인하지 못했어. 성공으로 처리하지 않을게.',2)
-
     def stop(self, message, code):
         if code==0 and getattr(self,'stage','') != 'COMPLETE':
-            message += ' 열쇠 획득과 문 열림은 아직 완료되지 않았어.'
+            message += ' exit_marker 도착까지는 아직 완료되지 않았어.'
             code = 2
         super().stop(message,code)
 
@@ -403,9 +429,12 @@ class CameraEscape(Mission):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--max-goals',type=int,default=40)
+    parser.add_argument('--inspection-goals',type=int,default=16)
     args,ros_args = parser.parse_known_args()
     if args.max_goals < 1:
         parser.error('--max-goals는 1 이상이어야 해.')
+    if args.inspection_goals < 1:
+        parser.error('--inspection-goals는 1 이상이어야 해.')
     try:
         passed = json.loads((ROOT/'logs/probe_pass.json').read_text())
         if passed['fingerprint'] != fingerprint() or passed['goals'] != 2:
@@ -415,7 +444,7 @@ def main():
     rclpy.init(args=ros_args,signal_handler_options=SignalHandlerOptions.NO)
     node = None
     try:
-        node = CameraEscape(args.max_goals)
+        node = CameraEscape(args.max_goals,args.inspection_goals)
         while rclpy.ok() and not node.done:
             rclpy.spin_once(node,timeout_sec=.1)
     except KeyboardInterrupt:

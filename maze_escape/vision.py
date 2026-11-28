@@ -44,6 +44,7 @@ def detect(rgb, depth):
         'key': cv2.inRange(hsv,(20,100,60),(40,255,255)),
         'door': cv2.bitwise_or(cv2.inRange(hsv,(0,110,55),(10,255,255)),
                               cv2.inRange(hsv,(170,110,55),(179,255,255))),
+        'exit': cv2.inRange(hsv,(45,100,60),(85,255,255)),
     }
     result = []
     for label,mask in masks.items():

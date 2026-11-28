@@ -27,7 +27,7 @@ def frame(rgb, t=10):
 
 def load_controller():
     names = ('rclpy','rclpy.action','rclpy.signals','rclpy.time','action_msgs.msg',
-             'nav2_msgs.action','sensor_msgs.msg','tf2_ros')
+             'nav2_msgs.action','nav2_msgs.srv','nav_msgs.msg','sensor_msgs.msg','tf2_ros')
     mocks = {name:MagicMock() for name in names}
     mocks.update({name.split('.')[0]:MagicMock() for name in names if '.' in name})
     mocks['maze_escape.mission'] = mission
@@ -38,6 +38,7 @@ def load_controller():
     with patch.dict(sys.modules,mocks):
         spec.loader.exec_module(module)
     module.GoalStatus = NS(STATUS_SUCCEEDED=4,STATUS_CANCELED=5,STATUS_ABORTED=6)
+    module.PassageControl.verify_open.__globals__['GoalStatus'] = module.GoalStatus
     return module
 
 
@@ -59,7 +60,7 @@ class VisionTests(unittest.TestCase):
         rgb,depth = self.image()
         rgb[15:35,10:30] = (0,255,0)
         rgb[10:50,50:70] = (100,150,200)
-        self.assertEqual(detect(rgb,depth),[])
+        self.assertEqual({d.label for d in detect(rgb,depth)},{'exit'})
 
     def test_invalid_or_misaligned_depth_cannot_detect(self):
         rgb,depth = self.image()
@@ -136,6 +137,27 @@ class ModelTests(unittest.TestCase):
 
 
 class ActuatorTests(unittest.TestCase):
+    def test_key_collection_removes_only_the_key_model(self):
+        actuator = SceneActuator(ROOT/'worlds/escape_room.world')
+        with patch('maze_escape.actuator.subprocess.run') as run:
+            run.return_value = NS(returncode=0,stdout='data: true',stderr='')
+            self.assertEqual(actuator.collect_key(),'red_key')
+            command = run.call_args.args[0]
+            self.assertIn('/world/maze/remove',command)
+            self.assertIn('gz.msgs.Entity',command)
+            self.assertIn('name: "red_key", type: MODEL',command)
+            self.assertNotIn('/world/maze/set_pose',command)
+            self.assertEqual(run.call_args.kwargs['timeout'],8)
+
+    def test_failed_key_removal_is_not_successful_collection(self):
+        actuator = SceneActuator(ROOT/'worlds/escape_room.world')
+        with patch('maze_escape.actuator.subprocess.run') as run:
+            run.return_value = NS(returncode=0,stdout='data: false',stderr='')
+            with self.assertRaises(RuntimeError):
+                actuator.collect_key()
+            with self.assertRaises(ValueError):
+                actuator.lift('red_key',True)
+
     def test_door_is_locked_until_key_collected(self):
         actuator = SceneActuator(ROOT/'worlds/escape_room.world')
         with patch('maze_escape.actuator.subprocess.run') as run:
@@ -165,6 +187,20 @@ class ControllerTests(unittest.TestCase):
         node.stop = MagicMock()
         node.goal_handle = MagicMock()
         node.key_collected = False
+        node.door_open = node.crossed_door = False
+        node.sim = lambda:10
+        node.frame_counter = 0
+        node.verification = None
+        node.last_report = 0
+        node.target_label = None
+        node.target_goal_kind = 'approach'
+        node.object_point = None
+        node.target = (0,0,0)
+        node.rejected = {label:[] for label in ('key','door','exit')}
+        node.replan_counts = {label:0 for label in ('key','door','exit')}
+        node.reacquire_counts = {label:0 for label in ('key','door','exit')}
+        node.resume_counts = {label:0 for label in ('key','door','exit')}
+        node.object_cooldown = {label:0.0 for label in ('key','door','exit')}
         return node
 
     def test_target_switch_waits_for_pending_goal_before_cancel(self):
@@ -190,6 +226,21 @@ class ControllerTests(unittest.TestCase):
         node.stop.assert_called_once()
         self.assertEqual(node.stop.call_args.args[1],2)
 
+    def test_key_arrival_requests_removal_and_waits_for_visual_confirmation(self):
+        node = self.node()
+        node.stage = 'VERIFY_KEY'
+        node.recent = lambda label:((.5,0,.2),10,.5)
+        node.worker,node.actuator = MagicMock(),MagicMock()
+        node.verify_arrival(10,(0,0,0))
+        node.worker.submit.assert_called_once_with(node.actuator.collect_key)
+        self.assertEqual(node.stage,'PICKING')
+        self.assertFalse(node.key_collected)
+        node.operation.done.return_value = True
+        node.sim = lambda:10
+        node.poll_operation(11)
+        self.assertEqual(node.stage,'VERIFY_PICKUP')
+        self.assertFalse(node.key_collected)
+
     def test_open_service_response_does_not_complete_mission(self):
         node = self.node()
         node.stage = 'OPENING'
@@ -203,6 +254,8 @@ class ControllerTests(unittest.TestCase):
 
     def test_rgb_depth_tf_pipeline_produces_a_camera_observation(self):
         node = self.node()
+        node.init_visual_search()
+        node.robot = lambda:(.5,.6,0)
         rgb = np.zeros((60,80,3),np.uint8)
         rgb[20:40,30:50] = (255,255,0)
         node.grid = NS(frame='map')
@@ -223,6 +276,9 @@ class ControllerTests(unittest.TestCase):
         self.assertIn('key',node.observations)
         np.testing.assert_allclose(node.observations['key'][0],(3.08,2,.2),atol=.02)
         self.assertEqual(node.image_pub.publish.call_count,3)
+        remembered = node.object_memory.candidates('key','map',11,set())
+        self.assertEqual(len(remembered),1)
+        self.assertEqual(remembered[0].pose,(.5,.6,0))
         node.stop.assert_not_called()
 
 

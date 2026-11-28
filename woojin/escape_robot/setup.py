@@ -27,7 +27,8 @@ setup(
             'detector_node = escape_robot.detector_node:main',
                 'approach_node = escape_robot.approach_node:main',
                 'fsm_node = escape_robot.fsm_node:main',
-                'escape_node = escape_robot.escape_node:main'
+                'escape_node = escape_robot.escape_node:main',
+                'scan_fixer = escape_robot.scan_fixer:main'
         ],
     },
 )
